@@ -1,7 +1,9 @@
 package telegram
 
 import (
+	"audiotranscrib/internal/storage"
 	"context"
+	"time"
 
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -13,7 +15,8 @@ import (
 func NewBot(cfg *config.Config) (*tele.Bot, error) {
 
 	pref := tele.Settings{
-		Token: cfg.TelegramToken,
+		Token:  cfg.TelegramToken,
+		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 	}
 
 	return tele.NewBot(pref)
@@ -22,13 +25,14 @@ func NewBot(cfg *config.Config) (*tele.Bot, error) {
 func StartBot(
 	lc fx.Lifecycle,
 	bot *tele.Bot,
+	storage *storage.DBStorage,
 	logger *zap.Logger,
 ) {
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 
-			registerHandlers(bot, logger)
+			registerHandlers(bot, storage, logger)
 
 			go bot.Start()
 

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"audiotranscrib/internal/storage"
+
 	"go.uber.org/fx"
 
 	"audiotranscrib/internal/config"
@@ -13,6 +15,11 @@ var Module = fx.Options(
 	fx.Provide(
 		config.InitConfig,
 		logger.InitLogger,
+
+		storage.NewDBStorage,
+		storage.NewUserRepo,
+		storage.NewMeetingRepo,
+
 		telegram.NewBot,
 	),
 
