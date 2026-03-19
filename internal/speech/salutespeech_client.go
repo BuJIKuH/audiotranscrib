@@ -1,6 +1,7 @@
 package speech
 
 import (
+	"audiotranscrib/internal/ai"
 	"audiotranscrib/internal/config"
 	"bytes"
 	"context"
@@ -62,10 +63,6 @@ type SpeakerSeparationOptions struct {
 	Count                 int  `json:"count"`
 }
 
-type Hypothesis struct {
-	Text string `json:"text"`
-}
-
 func NewClient(cfg *config.Config, logger *zap.Logger) *Client {
 	return &Client{
 		baseURL: "https://smartspeech.sber.ru/rest/v1",
@@ -78,7 +75,7 @@ func NewClient(cfg *config.Config, logger *zap.Logger) *Client {
 }
 
 func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
-	c.logger.Info("uploading audio", zap.Int("size_bytes", len(data)))
+	start := time.Now()
 
 	req, err := http.NewRequestWithContext(
 		ctx,
@@ -87,7 +84,7 @@ func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
 		bytes.NewReader(data),
 	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create upload request: %w", err)
 	}
 
 	token, err := c.getToken(ctx)
@@ -100,19 +97,21 @@ func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.client.Do(req)
+	c.logger.Info("upload audio", zap.Int("size_bytes", len(data)), zap.Duration("took", time.Since(start)))
+
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("upload request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read upload response body: %w", err)
-	}
-	c.logger.Info("upload response", zap.String("body", string(body))) //TODO: удалить в финальной версии
+	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("upload failed: %d %s", resp.StatusCode, string(body))
+		c.logger.Error("upload failed",
+			zap.Int("status", resp.StatusCode),
+			zap.ByteString("body", body),
+		)
+		return "", fmt.Errorf("upload failed: %d", resp.StatusCode)
 	}
 
 	var result struct {
@@ -122,7 +121,7 @@ func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
+		return "", fmt.Errorf("decode upload response: %w", err)
 	}
 
 	return result.Result.RequestFileID, nil
@@ -157,9 +156,8 @@ func (c *Client) createTask(ctx context.Context, fileID string) (string, error) 
 
 	b, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal createTask request: %w", err)
+		return "", fmt.Errorf("marshal createTask: %w", err)
 	}
-	c.logger.Info("FINAL REQUEST BODY", zap.String("json", string(b))) //TODO: удалить в финальной версии
 
 	req, err := http.NewRequestWithContext(
 		ctx,
@@ -168,7 +166,7 @@ func (c *Client) createTask(ctx context.Context, fileID string) (string, error) 
 		bytes.NewReader(b),
 	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create request: %w", err)
 	}
 
 	token, err := c.getToken(ctx)
@@ -180,17 +178,23 @@ func (c *Client) createTask(ctx context.Context, fileID string) (string, error) 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
+	start := time.Now()
 	resp, err := c.client.Do(req)
+	c.logger.Info("create task", zap.Duration("took", time.Since(start)))
+
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create task request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	bodyResp, _ := io.ReadAll(resp.Body)
-	c.logger.Info("create task response", zap.String("body", string(bodyResp)))
+	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status=%d body=%s", resp.StatusCode, string(bodyResp))
+		c.logger.Error("create task failed",
+			zap.Int("status", resp.StatusCode),
+			zap.ByteString("body", body),
+		)
+		return "", fmt.Errorf("create task failed: %d", resp.StatusCode)
 	}
 
 	var result struct {
@@ -199,47 +203,42 @@ func (c *Client) createTask(ctx context.Context, fileID string) (string, error) 
 		} `json:"result"`
 	}
 
-	if err := json.Unmarshal(bodyResp, &result); err != nil {
-		return "", err
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("decode createTask response: %w", err)
 	}
 
 	return result.Result.ID, nil
 }
 
 func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
 	for {
 		select {
 		case <-timeoutCtx.Done():
-			return "", fmt.Errorf("recognition timed out")
+			return "", fmt.Errorf("recognition timeout")
 		case <-time.After(3 * time.Second):
 			req, err := http.NewRequestWithContext(timeoutCtx, "GET", c.baseURL+"/task:get?id="+taskID, nil)
 			if err != nil {
-				return "", fmt.Errorf("failed to create task status request: %w", err)
+				return "", fmt.Errorf("create status request: %w", err)
 			}
 
 			token, err := c.getToken(timeoutCtx)
 			if err != nil {
 				return "", err
 			}
+
 			req.Header.Set("Authorization", "Bearer "+token)
 			req.Header.Set("Accept", "application/octet-stream")
 
 			resp, err := c.client.Do(req)
 			if err != nil {
-				return "", fmt.Errorf("failed to get task status: %w", err)
+				return "", fmt.Errorf("status request failed: %w", err)
 			}
 
-			body, err := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if err != nil {
-				return "", fmt.Errorf("failed to read task status response body: %w", err)
-			}
-			resp.Body.Close()
-
-			c.logger.Info("task status check", zap.String("body", string(body)))
 
 			var tmp struct {
 				Result struct {
@@ -249,16 +248,17 @@ func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) 
 			}
 
 			if err := json.Unmarshal(body, &tmp); err != nil {
-				c.logger.Warn("failed to unmarshal task status, retrying", zap.Error(err))
+				c.logger.Warn("failed to decode status", zap.Error(err))
 				continue
 			}
 
 			switch tmp.Result.Status {
 			case "NEW", "RUNNING":
 				continue
+
 			case "DONE":
 				if tmp.Result.ResponseFileID == "" {
-					c.logger.Warn("response_file_id empty, retrying")
+					c.logger.Warn("empty response_file_id")
 					continue
 				}
 
@@ -267,19 +267,16 @@ func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) 
 					return "", err
 				}
 
-				c.logger.Info("downloaded result body", zap.String("raw_body", string(data))) //TODO: удалить в финальной версии
-
 				var result struct {
 					Result []struct {
 						Results []struct {
-							Text           string `json:"text"`
 							NormalizedText string `json:"normalized_text"`
 						} `json:"results"`
 					} `json:"result"`
 				}
 
 				if err := json.Unmarshal(data, &result); err != nil {
-					return "", err
+					return "", fmt.Errorf("decode final result: %w", err)
 				}
 
 				var texts []string
@@ -290,12 +287,19 @@ func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) 
 				}
 
 				if len(texts) == 0 {
+					c.logger.Warn("empty transcription")
 					return "[не удалось распознать речь]", nil
 				}
 
-				return strings.Join(texts, " "), nil
+				final := strings.Join(texts, " ")
+				c.logger.Info("recognition success", zap.String("text", final))
+
+				return final, nil
 
 			case "ERROR", "CANCELED":
+				c.logger.Error("recognition failed",
+					zap.String("status", tmp.Result.Status),
+				)
 				return "", fmt.Errorf("recognition failed: %s", tmp.Result.Status)
 			}
 		}
@@ -310,7 +314,7 @@ func (c *Client) downloadResult(ctx context.Context, responseFileID string) ([]b
 		nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create download request: %w", err)
+		return nil, fmt.Errorf("create download request: %w", err)
 	}
 
 	token, err := c.getToken(ctx)
@@ -321,13 +325,60 @@ func (c *Client) downloadResult(ctx context.Context, responseFileID string) ([]b
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/octet-stream")
 
+	start := time.Now()
 	resp, err := c.client.Do(req)
+	c.logger.Info("download result", zap.Duration("took", time.Since(start)))
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to download result: %w", err)
+		return nil, fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	return io.ReadAll(resp.Body)
+}
+
+func (c *Client) getToken(ctx context.Context) (string, error) {
+	if c.accessToken != "" && time.Now().Before(c.expiresAt) {
+		return c.accessToken, nil
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		"https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+		strings.NewReader("scope=SALUTE_SPEECH_PERS"),
+	)
+	if err != nil {
+		return "", fmt.Errorf("create token request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("RqUID", uuid.New().String())
+	req.Header.Set("Authorization", "Basic "+c.token)
+
+	start := time.Now()
+	resp, err := c.client.Do(req)
+	c.logger.Info("speech token request", zap.Duration("took", time.Since(start)))
+
+	if err != nil {
+		return "", fmt.Errorf("token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result TokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode token: %w", err)
+	}
+
+	c.accessToken = result.AccessToken
+	c.expiresAt = time.Unix(result.ExpiresAt, 0).Add(-time.Minute)
+
+	c.logger.Info("speech token received",
+		zap.Time("expires_at", c.expiresAt),
+	)
+
+	return c.accessToken, nil
 }
 
 func (c *Client) Recognize(ctx context.Context, data []byte) (string, error) {
@@ -344,40 +395,17 @@ func (c *Client) Recognize(ctx context.Context, data []byte) (string, error) {
 	return c.waitResult(ctx, taskID)
 }
 
-func (c *Client) getToken(ctx context.Context) (string, error) {
-	if c.accessToken != "" && time.Now().Before(c.expiresAt) {
-		return c.accessToken, nil
-	}
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		"https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-		strings.NewReader("scope=SALUTE_SPEECH_PERS"),
-	)
+func (c *Client) RecognizeWithSummary(ctx context.Context, data []byte, gptClient *ai.GigaChatClient) (string, string, error) {
+	transcription, err := c.Recognize(ctx, data)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("RqUID", uuid.New().String())
-	req.Header.Set("Authorization", "Basic "+c.token)
-
-	resp, err := c.client.Do(req)
+	summary, err := gptClient.GetSummary(ctx, transcription)
 	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result TokenResponse
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		c.logger.Warn("summary failed", zap.Error(err))
+		summary = "[не удалось получить выжимку]"
 	}
 
-	c.accessToken = result.AccessToken
-	c.expiresAt = time.Unix(result.ExpiresAt, 0).Add(-1 * time.Minute)
-
-	return c.accessToken, nil
+	return transcription, summary, nil
 }

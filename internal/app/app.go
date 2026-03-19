@@ -1,6 +1,7 @@
 package app
 
 import (
+	"audiotranscrib/internal/ai"
 	"audiotranscrib/internal/speech"
 	"audiotranscrib/internal/storage"
 
@@ -23,6 +24,7 @@ var Module = fx.Options(
 
 		telegram.NewBot,
 		speech.NewClient,
+		ai.NewGigaChatClient,
 	),
 
 	fx.Invoke(

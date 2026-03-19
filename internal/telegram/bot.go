@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"audiotranscrib/internal/ai"
 	"audiotranscrib/internal/speech"
 	"audiotranscrib/internal/storage"
 	"context"
@@ -27,14 +28,16 @@ func StartBot(
 	lc fx.Lifecycle,
 	bot *tele.Bot,
 	storage *storage.DBStorage,
+	userRepo *storage.UserRepo,
 	speechClient *speech.Client,
+	gptClient *ai.GigaChatClient,
 	logger *zap.Logger,
 ) {
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 
-			registerHandlers(bot, storage, speechClient, logger)
+			registerHandlers(bot, storage, userRepo, speechClient, gptClient, logger)
 
 			go bot.Start()
 
