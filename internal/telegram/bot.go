@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"audiotranscrib/internal/speech"
 	"audiotranscrib/internal/storage"
 	"context"
 	"time"
@@ -26,13 +27,14 @@ func StartBot(
 	lc fx.Lifecycle,
 	bot *tele.Bot,
 	storage *storage.DBStorage,
+	speechClient *speech.Client,
 	logger *zap.Logger,
 ) {
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 
-			registerHandlers(bot, storage, logger)
+			registerHandlers(bot, storage, speechClient, logger)
 
 			go bot.Start()
 
@@ -40,7 +42,6 @@ func StartBot(
 
 			return nil
 		},
-
 		OnStop: func(ctx context.Context) error {
 
 			logger.Info("telegram bot stopped")

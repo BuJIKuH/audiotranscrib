@@ -1,0 +1,383 @@
+package speech
+
+import (
+	"audiotranscrib/internal/config"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+type Client struct {
+	baseURL string
+	token   string
+	client  *http.Client
+	logger  *zap.Logger
+
+	accessToken string
+	expiresAt   time.Time
+}
+
+type TokenResponse struct {
+	AccessToken string `json:"access_token"`
+	ExpiresAt   int64  `json:"expires_at"`
+}
+
+type CreateTaskRequest struct {
+	RequestFileID string  `json:"request_file_id"`
+	Options       Options `json:"options"`
+}
+
+type Options struct {
+	Model                    string                   `json:"model"`
+	AudioEncoding            string                   `json:"audio_encoding"`
+	SampleRate               int                      `json:"sample_rate"`
+	Language                 string                   `json:"language"`
+	EnableProfanityFilter    bool                     `json:"enable_profanity_filter"`
+	HypothesesCount          int                      `json:"hypotheses_count"`
+	NoSpeechTimeout          string                   `json:"no_speech_timeout"`
+	MaxSpeechTimeout         string                   `json:"max_speech_timeout"`
+	Hints                    Hints                    `json:"hints"`
+	ChannelsCount            int                      `json:"channels_count"`
+	SpeakerSeparationOptions SpeakerSeparationOptions `json:"speaker_separation_options"`
+	InsightModels            []string                 `json:"insight_models"`
+}
+
+type Hints struct {
+	Words         []string `json:"words"`
+	EnableLetters bool     `json:"enable_letters"`
+	EOUTimeout    string   `json:"eou_timeout"`
+}
+
+type SpeakerSeparationOptions struct {
+	Enable                bool `json:"enable"`
+	EnableOnlyMainSpeaker bool `json:"enable_only_main_speaker"`
+	Count                 int  `json:"count"`
+}
+
+type Hypothesis struct {
+	Text string `json:"text"`
+}
+
+func NewClient(cfg *config.Config, logger *zap.Logger) *Client {
+	return &Client{
+		baseURL: "https://smartspeech.sber.ru/rest/v1",
+		token:   cfg.SaluteSpeechKey,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		logger: logger,
+	}
+}
+
+func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
+	c.logger.Info("uploading audio", zap.Int("size_bytes", len(data)))
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		c.baseURL+"/data:upload",
+		bytes.NewReader(data),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "audio/ogg;codecs=opus")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read upload response body: %w", err)
+	}
+	c.logger.Info("upload response", zap.String("body", string(body))) //TODO: удалить в финальной версии
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("upload failed: %d %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Result struct {
+			RequestFileID string `json:"request_file_id"`
+		} `json:"result"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+
+	return result.Result.RequestFileID, nil
+}
+
+func (c *Client) createTask(ctx context.Context, fileID string) (string, error) {
+	reqBody := CreateTaskRequest{
+		RequestFileID: fileID,
+		Options: Options{
+			Model:                 "general",
+			AudioEncoding:         "OPUS",
+			SampleRate:            16000,
+			Language:              "ru-RU",
+			EnableProfanityFilter: true,
+			HypothesesCount:       1,
+			NoSpeechTimeout:       "2s",
+			MaxSpeechTimeout:      "2s",
+			Hints: Hints{
+				Words:         []string{"карту", "гуакамоле"},
+				EnableLetters: false,
+				EOUTimeout:    "1s",
+			},
+			ChannelsCount: 1,
+			SpeakerSeparationOptions: SpeakerSeparationOptions{
+				Enable:                false,
+				EnableOnlyMainSpeaker: false,
+				Count:                 1,
+			},
+			InsightModels: []string{"csi", "call_features"},
+		},
+	}
+
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal createTask request: %w", err)
+	}
+	c.logger.Info("FINAL REQUEST BODY", zap.String("json", string(b))) //TODO: удалить в финальной версии
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		c.baseURL+"/speech:async_recognize",
+		bytes.NewReader(b),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	bodyResp, _ := io.ReadAll(resp.Body)
+	c.logger.Info("create task response", zap.String("body", string(bodyResp)))
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status=%d body=%s", resp.StatusCode, string(bodyResp))
+	}
+
+	var result struct {
+		Result struct {
+			ID string `json:"id"`
+		} `json:"result"`
+	}
+
+	if err := json.Unmarshal(bodyResp, &result); err != nil {
+		return "", err
+	}
+
+	return result.Result.ID, nil
+}
+
+func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			return "", fmt.Errorf("recognition timed out")
+		case <-time.After(3 * time.Second):
+			req, err := http.NewRequestWithContext(timeoutCtx, "GET", c.baseURL+"/task:get?id="+taskID, nil)
+			if err != nil {
+				return "", fmt.Errorf("failed to create task status request: %w", err)
+			}
+
+			token, err := c.getToken(timeoutCtx)
+			if err != nil {
+				return "", err
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Accept", "application/octet-stream")
+
+			resp, err := c.client.Do(req)
+			if err != nil {
+				return "", fmt.Errorf("failed to get task status: %w", err)
+			}
+
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return "", fmt.Errorf("failed to read task status response body: %w", err)
+			}
+			resp.Body.Close()
+
+			c.logger.Info("task status check", zap.String("body", string(body)))
+
+			var tmp struct {
+				Result struct {
+					Status         string `json:"status"`
+					ResponseFileID string `json:"response_file_id"`
+				} `json:"result"`
+			}
+
+			if err := json.Unmarshal(body, &tmp); err != nil {
+				c.logger.Warn("failed to unmarshal task status, retrying", zap.Error(err))
+				continue
+			}
+
+			switch tmp.Result.Status {
+			case "NEW", "RUNNING":
+				continue
+			case "DONE":
+				if tmp.Result.ResponseFileID == "" {
+					c.logger.Warn("response_file_id empty, retrying")
+					continue
+				}
+
+				data, err := c.downloadResult(timeoutCtx, tmp.Result.ResponseFileID)
+				if err != nil {
+					return "", err
+				}
+
+				c.logger.Info("downloaded result body", zap.String("raw_body", string(data))) //TODO: удалить в финальной версии
+
+				var result struct {
+					Result []struct {
+						Results []struct {
+							Text           string `json:"text"`
+							NormalizedText string `json:"normalized_text"`
+						} `json:"results"`
+					} `json:"result"`
+				}
+
+				if err := json.Unmarshal(data, &result); err != nil {
+					return "", err
+				}
+
+				var texts []string
+				for _, r := range result.Result {
+					for _, res := range r.Results {
+						texts = append(texts, res.NormalizedText)
+					}
+				}
+
+				if len(texts) == 0 {
+					return "[не удалось распознать речь]", nil
+				}
+
+				return strings.Join(texts, " "), nil
+
+			case "ERROR", "CANCELED":
+				return "", fmt.Errorf("recognition failed: %s", tmp.Result.Status)
+			}
+		}
+	}
+}
+
+func (c *Client) downloadResult(ctx context.Context, responseFileID string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"GET",
+		c.baseURL+"/data:download?response_file_id="+responseFileID,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create download request: %w", err)
+	}
+
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/octet-stream")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download result: %w", err)
+	}
+	defer resp.Body.Close()
+
+	return io.ReadAll(resp.Body)
+}
+
+func (c *Client) Recognize(ctx context.Context, data []byte) (string, error) {
+	fileID, err := c.uploadFile(ctx, data)
+	if err != nil {
+		return "", err
+	}
+
+	taskID, err := c.createTask(ctx, fileID)
+	if err != nil {
+		return "", err
+	}
+
+	return c.waitResult(ctx, taskID)
+}
+
+func (c *Client) getToken(ctx context.Context) (string, error) {
+	if c.accessToken != "" && time.Now().Before(c.expiresAt) {
+		return c.accessToken, nil
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		"https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+		strings.NewReader("scope=SALUTE_SPEECH_PERS"),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("RqUID", uuid.New().String())
+	req.Header.Set("Authorization", "Basic "+c.token)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result TokenResponse
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	c.accessToken = result.AccessToken
+	c.expiresAt = time.Unix(result.ExpiresAt, 0).Add(-1 * time.Minute)
+
+	return c.accessToken, nil
+}

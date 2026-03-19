@@ -1,6 +1,7 @@
 package app
 
 import (
+	"audiotranscrib/internal/speech"
 	"audiotranscrib/internal/storage"
 
 	"go.uber.org/fx"
@@ -21,6 +22,7 @@ var Module = fx.Options(
 		storage.NewMeetingRepo,
 
 		telegram.NewBot,
+		speech.NewClient,
 	),
 
 	fx.Invoke(
