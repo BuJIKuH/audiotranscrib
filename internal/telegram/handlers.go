@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"io"
+	"time"
 
 	"go.uber.org/zap"
 	tele "gopkg.in/telebot.v3"
@@ -14,16 +15,135 @@ import (
 
 func registerHandlers(
 	bot *tele.Bot,
-	storage *storage.DBStorage,
+	repository *storage.DBStorage,
 	userRepo *storage.UserRepo,
 	speechClient *speech.Client,
 	gptClient *ai.GigaChatClient,
 	logger *zap.Logger,
 ) {
 
+	// --- helpers ---
+
+	getOrCreateUser := func(ctx context.Context, sender *tele.User) (*storage.User, error) {
+		user, err := userRepo.GetUserByTelegramID(ctx, sender.ID)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return userRepo.CreateUser(ctx, sender.ID, sender.Username)
+			}
+			return nil, err
+		}
+		return user, nil
+	}
+
+	processAudio := func(c tele.Context, file tele.File, mime string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		sender := c.Sender()
+
+		user, err := getOrCreateUser(ctx, sender)
+		if err != nil {
+			logger.Error("user error", zap.Error(err))
+			return c.Send("Ошибка пользователя")
+		}
+
+		reader, err := bot.File(&file)
+		if err != nil {
+			logger.Error("failed to get file", zap.Error(err))
+			return c.Send("Ошибка загрузки файла")
+		}
+		defer reader.Close()
+
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			logger.Error("read file failed", zap.Error(err))
+			return c.Send("Ошибка чтения файла")
+		}
+
+		// 🔒 ограничение размера (например 20MB)
+		if len(data) > 20*1024*1024 {
+			return c.Send("Файл слишком большой (макс 20MB)")
+		}
+
+		strategy := detectStrategy(mime)
+
+		var finalData []byte
+		finalMime := mime
+
+		switch strategy {
+
+		case StrategyDirect:
+			logger.Info("direct audio processing", zap.String("mime", mime))
+			finalData = data
+
+		case StrategyConvert:
+			logger.Info("converting audio", zap.String("mime", mime))
+
+			finalData, err = ConvertToPCM16k(data, logger)
+			if err != nil {
+				logger.Error("audio conversion failed", zap.Error(err))
+				return c.Send("Ошибка обработки аудио")
+			}
+
+			finalMime = "audio/wav"
+		}
+
+		// отправка в SaluteSpeech
+		transcription, err := speechClient.Recognize(ctx, finalData, finalMime)
+		if err != nil {
+			logger.Error("speech recognition failed", zap.Error(err))
+			return c.Send("Ошибка распознавания")
+		}
+
+		var summary string
+		if transcription != "" {
+			logger.Info("sending transcription to GigaChat",
+				zap.Int64("user_id", sender.ID),
+			)
+
+			summary, err = gptClient.GetSummary(ctx, transcription)
+			if err != nil {
+				logger.Warn("failed to get summary", zap.Error(err))
+				summary = ""
+			}
+		}
+
+		_, err = repository.SaveMeeting(ctx, user.ID, file.FileID, transcription, summary)
+		if err != nil {
+			logger.Error("failed to save meeting", zap.Error(err))
+			return c.Send("Ошибка сохранения встречи")
+		}
+
+		if summary != "" {
+			return c.Send(summary)
+		}
+		return c.Send(transcription)
+	}
+
+	// --- commands ---
+
+	bot.Handle(tele.OnDocument, func(c tele.Context) error {
+		msg := c.Message()
+		if msg == nil || msg.Document == nil {
+			logger.Warn("document is nil")
+			return c.Send("Не удалось получить файл")
+		}
+
+		doc := msg.Document
+
+		logger.Info("document received",
+			zap.String("name", doc.FileName),
+			zap.String("mime", doc.MIME),
+			zap.Int64("size", doc.FileSize),
+		)
+
+		return processAudio(c, doc.File, doc.MIME)
+	})
+
 	bot.Handle("/start", func(c tele.Context) error {
 		ctx := context.Background()
-		err := storage.CreateUser(ctx, c.Sender().ID, c.Sender().Username)
+
+		err := repository.CreateUser(ctx, c.Sender().ID, c.Sender().Username)
 		if err != nil {
 			logger.Error("cannot create user", zap.Error(err))
 			return c.Send("Ошибка регистрации")
@@ -53,68 +173,48 @@ func registerHandlers(
 		return c.Send("Чат с ИИ")
 	})
 
+	// --- voice ---
+
 	bot.Handle(tele.OnVoice, func(c tele.Context) error {
-		ctx := context.Background()
-
-		sender := c.Sender()
-		user, err := userRepo.GetUserByTelegramID(ctx, sender.ID)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				user, err = userRepo.CreateUser(ctx, sender.ID, sender.Username)
-				if err != nil {
-					logger.Error("failed to create user", zap.Error(err))
-					return c.Send("Ошибка создания пользователя")
-				}
-			} else {
-				logger.Error("failed to get user", zap.Error(err))
-				return c.Send("Ошибка доступа к пользователю")
-			}
+		msg := c.Message()
+		if msg == nil || msg.Voice == nil {
+			logger.Warn("voice message is nil")
+			return c.Send("Не удалось получить голосовое сообщение")
 		}
 
-		file := c.Message().Voice.File
-		reader, err := bot.File(&file)
-		if err != nil {
-			logger.Error("failed to get file", zap.Error(err))
-			return c.Send("Ошибка загрузки файла")
-		}
-		defer reader.Close()
+		file := msg.Voice.File
 
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			logger.Error("failed to read file", zap.Error(err))
-			return c.Send("Ошибка чтения файла")
-		}
+		mime := "audio/ogg"
 
-		transcription, err := speechClient.Recognize(ctx, data)
-		if err != nil {
-			logger.Error("speech recognition failed", zap.Error(err))
-			return c.Send("Ошибка распознавания")
-		}
-
-		var summary string
-		if transcription != "" {
-			logger.Info("sending transcription to GigaChat", zap.Int64("user_id", sender.ID))
-			summary, err = gptClient.GetSummary(ctx, transcription)
-			if err != nil {
-				logger.Warn("failed to get summary", zap.Error(err))
-				summary = ""
-			}
-		}
-
-		_, err = storage.SaveMeeting(ctx, user.ID, file.FileID, transcription, summary)
-		if err != nil {
-			logger.Error("failed to save meeting", zap.Error(err))
-			return c.Send("Ошибка сохранения встречи")
-		}
-
-		if summary != "" {
-			return c.Send(summary)
-		}
-		return c.Send(transcription)
+		return processAudio(c, file, mime)
 	})
 
+	// --- audio ---
+
 	bot.Handle(tele.OnAudio, func(c tele.Context) error {
-		logger.Info("audio message received", zap.Int64("user_id", c.Sender().ID))
-		return c.Send("Получен аудио файл")
+		msg := c.Message()
+
+		if msg == nil || msg.Audio == nil {
+			logger.Warn("audio message is nil")
+			return c.Send("Не удалось получить аудио")
+		}
+
+		audio := msg.Audio
+		if audio.FileSize > 20*1024*1024 {
+			return c.Send(
+				"Файл слишком большой 😢\n\n" +
+					"Попробуйте:\n" +
+					"• сжать аудио\n" +
+					"• отправить как voice\n" +
+					"• разбить на части",
+			)
+		}
+
+		logger.Info("audio meta",
+			zap.String("mime", audio.MIME),
+			zap.Int64("size", audio.FileSize),
+		)
+
+		return processAudio(c, audio.File, audio.MIME)
 	})
 }

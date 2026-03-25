@@ -1,7 +1,6 @@
 package speech
 
 import (
-	"audiotranscrib/internal/ai"
 	"audiotranscrib/internal/config"
 	"bytes"
 	"context"
@@ -74,8 +73,33 @@ func NewClient(cfg *config.Config, logger *zap.Logger) *Client {
 	}
 }
 
-func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
+func detectAudioParams(mime string) (string, int) {
+	mime = strings.ToLower(mime)
+
+	switch {
+	case strings.Contains(mime, "ogg"):
+		return "OPUS", 16000
+	case strings.Contains(mime, "mpeg"):
+		return "MP3", 44100
+	case strings.Contains(mime, "wav"):
+		return "PCM_S16LE", 16000
+	default:
+		return "PCM_S16LE", 16000
+	}
+}
+
+func (c *Client) uploadFile(ctx context.Context, data []byte, mime string) (string, error) {
 	start := time.Now()
+
+	contentType := "application/octet-stream"
+
+	if strings.Contains(mime, "ogg") {
+		contentType = "audio/ogg;codecs=opus"
+	} else if strings.Contains(mime, "mpeg") {
+		contentType = "audio/mpeg"
+	} else if strings.Contains(mime, "wav") {
+		contentType = "audio/wav"
+	}
 
 	req, err := http.NewRequestWithContext(
 		ctx,
@@ -93,11 +117,15 @@ func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "audio/ogg;codecs=opus")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.client.Do(req)
-	c.logger.Info("upload audio", zap.Int("size_bytes", len(data)), zap.Duration("took", time.Since(start)))
+	c.logger.Info("upload audio",
+		zap.Int("size_bytes", len(data)),
+		zap.String("content_type", contentType),
+		zap.Duration("took", time.Since(start)),
+	)
 
 	if err != nil {
 		return "", fmt.Errorf("upload request failed: %w", err)
@@ -127,13 +155,13 @@ func (c *Client) uploadFile(ctx context.Context, data []byte) (string, error) {
 	return result.Result.RequestFileID, nil
 }
 
-func (c *Client) createTask(ctx context.Context, fileID string) (string, error) {
+func (c *Client) createTask(ctx context.Context, fileID string, encoding string, sampleRate int) (string, error) {
 	reqBody := CreateTaskRequest{
 		RequestFileID: fileID,
 		Options: Options{
 			Model:                 "general",
-			AudioEncoding:         "OPUS",
-			SampleRate:            16000,
+			AudioEncoding:         encoding,
+			SampleRate:            sampleRate,
 			Language:              "ru-RU",
 			EnableProfanityFilter: true,
 			HypothesesCount:       1,
@@ -180,7 +208,11 @@ func (c *Client) createTask(ctx context.Context, fileID string) (string, error) 
 
 	start := time.Now()
 	resp, err := c.client.Do(req)
-	c.logger.Info("create task", zap.Duration("took", time.Since(start)))
+	c.logger.Info("create task",
+		zap.String("encoding", encoding),
+		zap.Int("sample_rate", sampleRate),
+		zap.Duration("took", time.Since(start)),
+	)
 
 	if err != nil {
 		return "", fmt.Errorf("create task request failed: %w", err)
@@ -211,7 +243,7 @@ func (c *Client) createTask(ctx context.Context, fileID string) (string, error) 
 }
 
 func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	for {
@@ -381,31 +413,24 @@ func (c *Client) getToken(ctx context.Context) (string, error) {
 	return c.accessToken, nil
 }
 
-func (c *Client) Recognize(ctx context.Context, data []byte) (string, error) {
-	fileID, err := c.uploadFile(ctx, data)
+func (c *Client) Recognize(ctx context.Context, data []byte, mime string) (string, error) {
+	encoding, sampleRate := detectAudioParams(mime)
+
+	c.logger.Info("audio params",
+		zap.String("mime", mime),
+		zap.String("encoding", encoding),
+		zap.Int("sample_rate", sampleRate),
+	)
+
+	fileID, err := c.uploadFile(ctx, data, mime)
 	if err != nil {
 		return "", err
 	}
 
-	taskID, err := c.createTask(ctx, fileID)
+	taskID, err := c.createTask(ctx, fileID, encoding, sampleRate)
 	if err != nil {
 		return "", err
 	}
 
 	return c.waitResult(ctx, taskID)
-}
-
-func (c *Client) RecognizeWithSummary(ctx context.Context, data []byte, gptClient *ai.GigaChatClient) (string, string, error) {
-	transcription, err := c.Recognize(ctx, data)
-	if err != nil {
-		return "", "", err
-	}
-
-	summary, err := gptClient.GetSummary(ctx, transcription)
-	if err != nil {
-		c.logger.Warn("summary failed", zap.Error(err))
-		summary = "[не удалось получить выжимку]"
-	}
-
-	return transcription, summary, nil
 }

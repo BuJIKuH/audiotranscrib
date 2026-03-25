@@ -133,8 +133,9 @@ func (c *GigaChatClient) GetSummary(ctx context.Context, text string) (string, e
 		Model: "GigaChat",
 		Messages: []ChatMessage{
 			{
-				Role:    "system",
-				Content: "Сделай краткое резюме текста",
+				Role: "system",
+				Content: "Сделай краткое резюме текста таким образом, чтобы важная информация не потерялась. " +
+					"Если это запись встречи, сделай разграничение по ролям.",
 			},
 			{
 				Role:    "user",
