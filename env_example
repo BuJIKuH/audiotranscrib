@@ -1,0 +1,9 @@
+TELEGRAM_TOKEN=
+DATABASE_DNS=postgres://audiotranscrib:audiotranscrib_pass@localhost:5432/audiotranscrib_db?sslmode=disable
+
+GIGACHAT_CLIENT_ID=
+GIGACHAT_SECRET=
+
+GIGA_CHAT_KEY=
+
+SALUTE_SPEECH_KEY=
