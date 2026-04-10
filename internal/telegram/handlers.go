@@ -6,7 +6,10 @@ import (
 	"audiotranscrib/internal/storage"
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -154,23 +157,133 @@ func registerHandlers(
 	})
 
 	bot.Handle("/list", func(c tele.Context) error {
-		logger.Info("command list", zap.Int64("user_id", c.Sender().ID))
-		return c.Send("Список встреч")
+		ctx := context.Background()
+
+		user, err := userRepo.GetUserByTelegramID(ctx, c.Sender().ID)
+		if err != nil {
+			return c.Send("Пользователь не найден")
+		}
+
+		meetings, err := repository.ListMeetings(ctx, user.ID)
+		if err != nil {
+			return c.Send("Ошибка получения списка")
+		}
+
+		if len(meetings) == 0 {
+			return c.Send("У вас пока нет встреч")
+		}
+
+		var resp string
+		resp += "📚 Ваши встречи:\n\n"
+
+		for _, m := range meetings {
+			resp += fmt.Sprintf(
+				"ID: %d\n📅 %s\n📎 %s\n📝 %s\n\n",
+				m.ID,
+				m.CreatedAt.Format("02.01.2006 15:04"),
+				m.FileName,
+				truncate(m.Transcription, 200),
+			)
+		}
+
+		return sendLongMessage(c, resp, logger)
 	})
 
 	bot.Handle("/get", func(c tele.Context) error {
-		logger.Info("command get", zap.Int64("user_id", c.Sender().ID))
-		return c.Send("Получение встречи")
+		ctx := context.Background()
+
+		args := c.Args()
+		if len(args) == 0 {
+			return c.Send("Использование: /get <id>")
+		}
+
+		id, err := strconv.Atoi(args[0])
+		if err != nil {
+			return c.Send("Некорректный ID")
+		}
+
+		user, err := userRepo.GetUserByTelegramID(ctx, c.Sender().ID)
+		if err != nil {
+			return c.Send("Пользователь не найден")
+		}
+
+		meeting, err := repository.GetMeeting(ctx, id, user.ID)
+		if err != nil {
+			return c.Send("Встреча не найдена")
+		}
+
+		resp := fmt.Sprintf(
+			"📝 Транскрипция:\n\n%s\n\n📌 Summary:\n%s",
+			meeting.Transcription,
+			meeting.Summary,
+		)
+
+		if len(resp) > 4000 {
+			resp = resp[:4000] + "..."
+		}
+
+		return c.Send(resp)
 	})
 
 	bot.Handle("/find", func(c tele.Context) error {
-		logger.Info("command find", zap.Int64("user_id", c.Sender().ID))
-		return c.Send("Поиск встречи")
+		ctx := context.Background()
+
+		args := c.Args()
+		if len(args) == 0 {
+			return c.Send("Использование: /find <слово>")
+		}
+
+		query := strings.Join(args, " ")
+
+		user, err := userRepo.GetUserByTelegramID(ctx, c.Sender().ID)
+		if err != nil {
+			return c.Send("Пользователь не найден")
+		}
+
+		results, err := repository.FindMeetings(ctx, user.ID, query)
+		if err != nil {
+			return c.Send("Ошибка поиска")
+		}
+
+		if len(results) == 0 {
+			return c.Send("Ничего не найдено")
+		}
+
+		var resp string
+		resp += "🔎 Найдено:\n\n"
+
+		for _, r := range results {
+			resp += fmt.Sprintf(
+				"ID: %d\n📌 %s\n📝 %s\n\n",
+				r.ID,
+				r.Summary,
+				truncate(r.Transcription, 200),
+			)
+		}
+
+		return sendLongMessage(c, resp, logger)
 	})
 
 	bot.Handle("/chat", func(c tele.Context) error {
-		logger.Info("command chat", zap.Int64("user_id", c.Sender().ID))
-		return c.Send("Чат с ИИ")
+		ctx := context.Background()
+
+		args := c.Args()
+		if len(args) == 0 {
+			return c.Send(
+				"🤖 Напиши вопрос после команды\n\n" +
+					"Пример:\n" +
+					"/chat что обсуждали на встрече?",
+			)
+		}
+
+		question := strings.Join(args, " ")
+
+		answer, err := gptClient.Ask(ctx, question)
+		if err != nil {
+			return c.Send("Ошибка ИИ")
+		}
+
+		return c.Send(answer)
 	})
 
 	// --- voice ---
@@ -217,4 +330,39 @@ func registerHandlers(
 
 		return processAudio(c, audio.File, audio.MIME)
 	})
+}
+
+func truncate(text string, max int) string {
+	if len(text) <= max {
+		return text
+	}
+	return text[:max] + "..."
+}
+
+func sendLongMessage(c tele.Context, text string, logger *zap.Logger) error {
+	const chunkSize = 4000
+
+	logger.Info("sending message", zap.Int("length", len(text)))
+
+	for len(text) > chunkSize {
+		chunk := text[:chunkSize]
+
+		logger.Info("sending chunk", zap.Int("size", len(chunk)))
+
+		err := c.Send(chunk)
+		if err != nil {
+			logger.Error("failed to send chunk", zap.Error(err))
+			return err
+		}
+
+		text = text[chunkSize:]
+	}
+
+	if len(text) > 0 {
+		logger.Info("sending last chunk", zap.Int("size", len(text)))
+
+		return c.Send(text)
+	}
+
+	return nil
 }

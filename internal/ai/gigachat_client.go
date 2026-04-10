@@ -204,3 +204,62 @@ func (c *GigaChatClient) GetSummary(ctx context.Context, text string) (string, e
 
 	return result, nil
 }
+
+func (c *GigaChatClient) Ask(ctx context.Context, prompt string) (string, error) {
+	token, err := c.getToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	reqBody := map[string]interface{}{
+		"model": "GigaChat",
+		"messages": []map[string]string{
+			{
+				"role":    "user",
+				"content": prompt,
+			},
+		},
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		"https://gigachat.devices.sberbank.ru/api/v1/chat/completions", // например https://gigachat.devices.sberbank.ru/api/v1/chat/completions
+		bytes.NewBuffer(bodyBytes),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	if len(result.Choices) == 0 {
+		return "", fmt.Errorf("empty response")
+	}
+
+	return result.Choices[0].Message.Content, nil
+}

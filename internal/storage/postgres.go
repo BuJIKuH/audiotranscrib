@@ -104,11 +104,12 @@ func (s *DBStorage) SaveMeeting(ctx context.Context, userID int, fileName, trans
 
 func (s *DBStorage) ListMeetings(ctx context.Context, userID int) ([]Meeting, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, file_name, created_at
+		SELECT id, file_name, transcription, created_at
 		FROM meetings
 		WHERE user_id=$1
 		ORDER BY created_at DESC
 	`, userID)
+
 	if err != nil {
 		s.Logger.Error("failed to list meetings",
 			zap.Int("user_id", userID),
@@ -121,7 +122,7 @@ func (s *DBStorage) ListMeetings(ctx context.Context, userID int) ([]Meeting, er
 	var meetings []Meeting
 	for rows.Next() {
 		var m Meeting
-		if err := rows.Scan(&m.ID, &m.FileName, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.FileName, &m.Transcription, &m.CreatedAt); err != nil {
 			s.Logger.Warn("failed to scan meeting row", zap.Error(err))
 			continue
 		}
@@ -135,12 +136,12 @@ func (s *DBStorage) ListMeetings(ctx context.Context, userID int) ([]Meeting, er
 	return meetings, nil
 }
 
-func (s *DBStorage) GetMeeting(ctx context.Context, id int) (*Meeting, error) {
+func (s *DBStorage) GetMeeting(ctx context.Context, id int, userID int) (*Meeting, error) {
 	row := s.DB.QueryRowContext(ctx, `
 		SELECT id, transcription, summary
 		FROM meetings
-		WHERE id=$1
-	`, id)
+		WHERE id=$1 AND user_id=$2
+	`, id, userID)
 
 	var m Meeting
 	if err := row.Scan(&m.ID, &m.Transcription, &m.Summary); err != nil {
@@ -157,12 +158,14 @@ func (s *DBStorage) GetMeeting(ctx context.Context, id int) (*Meeting, error) {
 	return &m, nil
 }
 
-func (s *DBStorage) FindMeetings(ctx context.Context, keyword string) ([]Meeting, error) {
+func (s *DBStorage) FindMeetings(ctx context.Context, userID int, keyword string) ([]Meeting, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, summary
+		SELECT id, summary, transcription
 		FROM meetings
-		WHERE to_tsvector('russian', transcription) @@ plainto_tsquery($1)
-	`, keyword)
+		WHERE user_id = $1
+		AND to_tsvector('russian', transcription) @@ plainto_tsquery('russian', $2)
+	`, userID, keyword)
+
 	if err != nil {
 		s.Logger.Error("failed to search meetings",
 			zap.String("keyword", keyword),
@@ -175,7 +178,7 @@ func (s *DBStorage) FindMeetings(ctx context.Context, keyword string) ([]Meeting
 	var meetings []Meeting
 	for rows.Next() {
 		var m Meeting
-		if err := rows.Scan(&m.ID, &m.Summary); err != nil {
+		if err := rows.Scan(&m.ID, &m.Summary, &m.Transcription); err != nil {
 			s.Logger.Warn("failed to scan meeting row during search", zap.Error(err))
 			continue
 		}
