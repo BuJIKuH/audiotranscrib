@@ -15,7 +15,6 @@ import (
 )
 
 func NewBot(cfg *config.Config) (*tele.Bot, error) {
-
 	pref := tele.Settings{
 		Token:  cfg.TelegramToken,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -27,8 +26,8 @@ func NewBot(cfg *config.Config) (*tele.Bot, error) {
 func StartBot(
 	lc fx.Lifecycle,
 	bot *tele.Bot,
-	storage *storage.DBStorage,
 	userRepo *storage.UserRepo,
+	meetingRepo *storage.MeetingRepo,
 	speechClient *speech.Client,
 	gptClient *ai.GigaChatClient,
 	logger *zap.Logger,
@@ -37,7 +36,14 @@ func StartBot(
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 
-			registerHandlers(bot, storage, userRepo, speechClient, gptClient, logger)
+			registerHandlers(
+				bot,
+				userRepo,
+				meetingRepo,
+				speechClient,
+				gptClient,
+				logger,
+			)
 
 			go bot.Start()
 
@@ -45,12 +51,10 @@ func StartBot(
 
 			return nil
 		},
+
 		OnStop: func(ctx context.Context) error {
-
 			logger.Info("telegram bot stopped")
-
 			bot.Stop()
-
 			return nil
 		},
 	})

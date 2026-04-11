@@ -18,8 +18,8 @@ import (
 
 func registerHandlers(
 	bot *tele.Bot,
-	repository *storage.DBStorage,
 	userRepo *storage.UserRepo,
+	meetingRepo *storage.MeetingRepo,
 	speechClient *speech.Client,
 	gptClient *ai.GigaChatClient,
 	logger *zap.Logger,
@@ -63,7 +63,6 @@ func registerHandlers(
 			return c.Send("Ошибка чтения файла")
 		}
 
-		// 🔒 ограничение размера (например 20MB)
 		if len(data) > 20*1024*1024 {
 			return c.Send("Файл слишком большой (макс 20MB)")
 		}
@@ -91,7 +90,6 @@ func registerHandlers(
 			finalMime = "audio/wav"
 		}
 
-		// отправка в SaluteSpeech
 		transcription, err := speechClient.Recognize(ctx, finalData, finalMime)
 		if err != nil {
 			logger.Error("speech recognition failed", zap.Error(err))
@@ -111,7 +109,14 @@ func registerHandlers(
 			}
 		}
 
-		_, err = repository.SaveMeeting(ctx, user.ID, file.FileID, transcription, summary)
+		m := &storage.Meeting{
+			UserID:        user.ID,
+			FileName:      file.FileID,
+			Transcription: transcription,
+			Summary:       summary,
+		}
+
+		err = meetingRepo.SaveMeeting(ctx, m)
 		if err != nil {
 			logger.Error("failed to save meeting", zap.Error(err))
 			return c.Send("Ошибка сохранения встречи")
@@ -146,7 +151,7 @@ func registerHandlers(
 	bot.Handle("/start", func(c tele.Context) error {
 		ctx := context.Background()
 
-		err := repository.CreateUser(ctx, c.Sender().ID, c.Sender().Username)
+		_, err := userRepo.CreateUser(ctx, c.Sender().ID, c.Sender().Username)
 		if err != nil {
 			logger.Error("cannot create user", zap.Error(err))
 			return c.Send("Ошибка регистрации")
@@ -164,7 +169,7 @@ func registerHandlers(
 			return c.Send("Пользователь не найден")
 		}
 
-		meetings, err := repository.ListMeetings(ctx, user.ID)
+		meetings, err := meetingRepo.ListMeetingsByUser(ctx, user.ID)
 		if err != nil {
 			return c.Send("Ошибка получения списка")
 		}
@@ -207,8 +212,8 @@ func registerHandlers(
 			return c.Send("Пользователь не найден")
 		}
 
-		meeting, err := repository.GetMeeting(ctx, id, user.ID)
-		if err != nil {
+		meeting, err := meetingRepo.GetMeetingByID(ctx, id)
+		if err != nil || meeting.UserID != user.ID {
 			return c.Send("Встреча не найдена")
 		}
 
@@ -240,9 +245,17 @@ func registerHandlers(
 			return c.Send("Пользователь не найден")
 		}
 
-		results, err := repository.FindMeetings(ctx, user.ID, query)
+		meetings, err := meetingRepo.ListMeetingsByUser(ctx, user.ID)
 		if err != nil {
 			return c.Send("Ошибка поиска")
+		}
+
+		var results []storage.Meeting
+		for _, m := range meetings {
+			if strings.Contains(strings.ToLower(m.Transcription), strings.ToLower(query)) ||
+				strings.Contains(strings.ToLower(m.Summary), strings.ToLower(query)) {
+				results = append(results, m)
+			}
 		}
 
 		if len(results) == 0 {
@@ -296,7 +309,6 @@ func registerHandlers(
 		}
 
 		file := msg.Voice.File
-
 		mime := "audio/ogg"
 
 		return processAudio(c, file, mime)
@@ -349,8 +361,7 @@ func sendLongMessage(c tele.Context, text string, logger *zap.Logger) error {
 
 		logger.Info("sending chunk", zap.Int("size", len(chunk)))
 
-		err := c.Send(chunk)
-		if err != nil {
+		if err := c.Send(chunk); err != nil {
 			logger.Error("failed to send chunk", zap.Error(err))
 			return err
 		}
@@ -360,7 +371,6 @@ func sendLongMessage(c tele.Context, text string, logger *zap.Logger) error {
 
 	if len(text) > 0 {
 		logger.Info("sending last chunk", zap.Int("size", len(text)))
-
 		return c.Send(text)
 	}
 

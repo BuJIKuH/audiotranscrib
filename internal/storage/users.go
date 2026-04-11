@@ -15,29 +15,29 @@ type User struct {
 }
 
 type UserRepo struct {
-	storage *DBStorage
-	logger  *zap.Logger
+	*Repository
 }
 
 func NewUserRepo(storage *DBStorage, logger *zap.Logger) *UserRepo {
 	return &UserRepo{
-		storage: storage,
-		logger:  logger,
+		Repository: NewRepository(storage, logger),
 	}
 }
 
 func (r *UserRepo) CreateUser(ctx context.Context, telegramID int64, username string) (*User, error) {
-	var id int
-	err := r.storage.DB.QueryRowContext(
+	var u User
+
+	err := r.QueryRow(
 		ctx,
 		`INSERT INTO users (telegram_id, username)
 		 VALUES ($1, $2)
 		 ON CONFLICT (telegram_id) DO UPDATE
 		 SET username = EXCLUDED.username
-		 RETURNING id`,
+		 RETURNING id, telegram_id, username, created_at`,
 		telegramID,
 		username,
-	).Scan(&id)
+	).Scan(&u.ID, &u.TelegramID, &u.Username, &u.CreatedAt)
+
 	if err != nil {
 		r.logger.Error("failed to create user",
 			zap.Int64("telegram_id", telegramID),
@@ -47,32 +47,26 @@ func (r *UserRepo) CreateUser(ctx context.Context, telegramID int64, username st
 		return nil, err
 	}
 
-	user := &User{
-		ID:         id,
-		TelegramID: telegramID,
-		Username:   username,
-		CreatedAt:  time.Now(),
-	}
-
 	r.logger.Info("user created/updated",
-		zap.Int("id", user.ID),
-		zap.Int64("telegram_id", user.TelegramID),
-		zap.String("username", user.Username),
+		zap.Int("id", u.ID),
+		zap.Int64("telegram_id", u.TelegramID),
+		zap.String("username", u.Username),
 	)
 
-	return user, nil
+	return &u, nil
 }
 
 func (r *UserRepo) GetUserByTelegramID(ctx context.Context, telegramID int64) (*User, error) {
-	u := &User{}
-	err := r.storage.DB.QueryRowContext(
+	row := r.QueryRow(
 		ctx,
 		`SELECT id, telegram_id, username, created_at
 		 FROM users
 		 WHERE telegram_id = $1`,
 		telegramID,
-	).Scan(&u.ID, &u.TelegramID, &u.Username, &u.CreatedAt)
-	if err != nil {
+	)
+
+	u := &User{}
+	if err := row.Scan(&u.ID, &u.TelegramID, &u.Username, &u.CreatedAt); err != nil {
 		r.logger.Error("failed to get user by telegram_id",
 			zap.Int64("telegram_id", telegramID),
 			zap.Error(err),

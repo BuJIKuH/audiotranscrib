@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +53,8 @@ type GigaChatClient struct {
 	expiresAt   time.Time
 	client      *http.Client
 	logger      *zap.Logger
+
+	mu sync.Mutex
 }
 
 type TokenResponse struct {
@@ -70,6 +73,9 @@ func NewGigaChatClient(cfg *config.Config, logger *zap.Logger) *GigaChatClient {
 }
 
 func (c *GigaChatClient) getToken(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.accessToken != "" && time.Now().Before(c.expiresAt) {
 		return c.accessToken, nil
 	}

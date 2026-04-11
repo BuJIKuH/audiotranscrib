@@ -17,27 +17,25 @@ type Meeting struct {
 }
 
 type MeetingRepo struct {
-	storage *DBStorage
-	logger  *zap.Logger
+	*Repository
 }
 
 func NewMeetingRepo(storage *DBStorage, logger *zap.Logger) *MeetingRepo {
 	return &MeetingRepo{
-		storage: storage,
-		logger:  logger,
+		Repository: NewRepository(storage, logger),
 	}
 }
 
 func (r *MeetingRepo) SaveMeeting(ctx context.Context, m *Meeting) error {
-	err := r.storage.DB.QueryRowContext(
+	err := r.QueryRow(
 		ctx,
 		`INSERT INTO meetings (user_id, file_name, transcription, summary, created_at)
-		 VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-		m.UserID, m.FileName, m.Transcription, m.Summary, time.Now(),
+		 VALUES ($1,$2,$3,$4, NOW()) RETURNING id`,
+		m.UserID, m.FileName, m.Transcription, m.Summary,
 	).Scan(&m.ID)
 
 	if err != nil {
-		r.storage.Logger.Error("failed to save meeting",
+		r.logger.Error("failed to save meeting",
 			zap.Int("user_id", m.UserID),
 			zap.String("file_name", m.FileName),
 			zap.Error(err),
@@ -45,7 +43,7 @@ func (r *MeetingRepo) SaveMeeting(ctx context.Context, m *Meeting) error {
 		return err
 	}
 
-	r.storage.Logger.Info("meeting saved",
+	r.logger.Info("meeting saved",
 		zap.Int("meeting_id", m.ID),
 		zap.Int("user_id", m.UserID),
 	)
@@ -53,7 +51,7 @@ func (r *MeetingRepo) SaveMeeting(ctx context.Context, m *Meeting) error {
 }
 
 func (r *MeetingRepo) ListMeetingsByUser(ctx context.Context, userID int) ([]Meeting, error) {
-	rows, err := r.storage.DB.QueryContext(
+	rows, err := r.Query(
 		ctx,
 		`SELECT id, user_id, file_name, transcription, summary, created_at
 		 FROM meetings
@@ -62,7 +60,7 @@ func (r *MeetingRepo) ListMeetingsByUser(ctx context.Context, userID int) ([]Mee
 		userID,
 	)
 	if err != nil {
-		r.storage.Logger.Error("failed to list meetings",
+		r.logger.Error("failed to list meetings",
 			zap.Int("user_id", userID),
 			zap.Error(err),
 		)
@@ -74,13 +72,21 @@ func (r *MeetingRepo) ListMeetingsByUser(ctx context.Context, userID int) ([]Mee
 	for rows.Next() {
 		var m Meeting
 		if err := rows.Scan(&m.ID, &m.UserID, &m.FileName, &m.Transcription, &m.Summary, &m.CreatedAt); err != nil {
-			r.storage.Logger.Warn("failed to scan meeting row", zap.Error(err))
+			r.logger.Warn("failed to scan meeting row", zap.Error(err))
 			continue
 		}
 		meetings = append(meetings, m)
 	}
 
-	r.storage.Logger.Info("meetings fetched",
+	if err := rows.Err(); err != nil {
+		r.logger.Error("rows iteration error",
+			zap.Int("user_id", userID),
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
+	r.logger.Info("meetings fetched",
 		zap.Int("user_id", userID),
 		zap.Int("count", len(meetings)),
 	)
@@ -88,7 +94,7 @@ func (r *MeetingRepo) ListMeetingsByUser(ctx context.Context, userID int) ([]Mee
 }
 
 func (r *MeetingRepo) GetMeetingByID(ctx context.Context, id int) (*Meeting, error) {
-	row := r.storage.DB.QueryRowContext(
+	row := r.QueryRow(
 		ctx,
 		`SELECT id, user_id, file_name, transcription, summary, created_at
 		 FROM meetings
@@ -98,14 +104,14 @@ func (r *MeetingRepo) GetMeetingByID(ctx context.Context, id int) (*Meeting, err
 
 	m := &Meeting{}
 	if err := row.Scan(&m.ID, &m.UserID, &m.FileName, &m.Transcription, &m.Summary, &m.CreatedAt); err != nil {
-		r.storage.Logger.Error("failed to get meeting by ID",
+		r.logger.Error("failed to get meeting by ID",
 			zap.Int("meeting_id", id),
 			zap.Error(err),
 		)
 		return nil, err
 	}
 
-	r.storage.Logger.Info("meeting fetched by ID",
+	r.logger.Info("meeting fetched by ID",
 		zap.Int("meeting_id", m.ID),
 		zap.Int("user_id", m.UserID),
 	)

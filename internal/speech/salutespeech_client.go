@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,8 @@ type Client struct {
 
 	accessToken string
 	expiresAt   time.Time
+
+	mu sync.Mutex
 }
 
 type TokenResponse struct {
@@ -246,11 +249,15 @@ func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-timeoutCtx.Done():
 			return "", fmt.Errorf("recognition timeout")
-		case <-time.After(3 * time.Second):
+
+		case <-ticker.C:
 			req, err := http.NewRequestWithContext(timeoutCtx, "GET", c.baseURL+"/task:get?id="+taskID, nil)
 			if err != nil {
 				return "", fmt.Errorf("create status request: %w", err)
@@ -319,19 +326,12 @@ func (c *Client) waitResult(ctx context.Context, taskID string) (string, error) 
 				}
 
 				if len(texts) == 0 {
-					c.logger.Warn("empty transcription")
 					return "[не удалось распознать речь]", nil
 				}
 
-				final := strings.Join(texts, " ")
-				c.logger.Info("recognition success", zap.String("text", final))
-
-				return final, nil
+				return strings.Join(texts, " "), nil
 
 			case "ERROR", "CANCELED":
-				c.logger.Error("recognition failed",
-					zap.String("status", tmp.Result.Status),
-				)
 				return "", fmt.Errorf("recognition failed: %s", tmp.Result.Status)
 			}
 		}
@@ -370,6 +370,9 @@ func (c *Client) downloadResult(ctx context.Context, responseFileID string) ([]b
 }
 
 func (c *Client) getToken(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.accessToken != "" && time.Now().Before(c.expiresAt) {
 		return c.accessToken, nil
 	}
